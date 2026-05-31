@@ -164,3 +164,9 @@ func (p *Provider) saveUser(user *PasskeyUser) error {
 	}
 	return txn.Commit()
 }
+
+// SetGUIKit allows the test suite to inject the GUIKit dependency 
+// into the provider instance without exporting the internal field.
+func (p *Provider) SetGUIKit(gk *guikit.GUIKit) {
+    p.gk = gk
+}
