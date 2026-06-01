@@ -5,27 +5,25 @@ import "net/http"
 func (p *Provider) ServeJS(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript")
 	_, _ = w.Write([]byte(`
+// Capture the exact origin safely for the network payload
+const authScope = window.location.origin;
+
 async function passkeyRegister(username) {
     try {
         if (!username) throw new Error("Please enter a username");
-        const resp = await fetch('/auth/register/begin?username=' + encodeURIComponent(username));
-        if (!resp.ok) throw new Error("Server error: " + await resp.text());
-        const opts = await resp.json();
         
+        // Pass scope safely as a query parameter to the backend
+        const resp = await fetch('/auth/register/begin?username=' + encodeURIComponent(username) + '&scope=' + encodeURIComponent(authScope));
+        if (!resp.ok) throw new Error("Server error: " + await resp.text());
+        
+        const opts = await resp.json();
         opts.publicKey.challenge = base64urlToBuffer(opts.publicKey.challenge);
         opts.publicKey.user.id = base64urlToBuffer(opts.publicKey.user.id);
         if(opts.publicKey.excludeCredentials) { opts.publicKey.excludeCredentials.forEach(c => c.id = base64urlToBuffer(c.id)); }
         
-        // DBSC FIX: Explicitly request hardware-bound session extensions and define the scope
-        opts.publicKey.extensions = opts.publicKey.extensions || {};
-        opts.publicKey.extensions.devicePubKey = { attestation: "none" };
-        opts.publicKey.extensions.sessionScope = window.location.origin;
-
+        // Let the native API execute with pristine, valid options
         const cred = await navigator.credentials.create({ publicKey: opts.publicKey });
         
-        // Extract the hardware extension results to send back to the SDF SessionManager
-        const extResults = cred.getClientExtensionResults();
-
         const finishResp = await fetch('/auth/register/finish?username=' + encodeURIComponent(username), {
             method: 'POST', 
             headers: { 'Content-Type': 'application/json' },
@@ -33,42 +31,39 @@ async function passkeyRegister(username) {
                 id: cred.id, 
                 rawId: bufferToBase64url(cred.rawId), 
                 type: cred.type, 
-                extensions: extResults, // Pass DBSC payload to backend
+                scope: authScope, // Inject scope into the backend validation payload
                 response: { 
                     attestationObject: bufferToBase64url(cred.response.attestationObject), 
                     clientDataJSON: bufferToBase64url(cred.response.clientDataJSON), 
                 }, 
             }),
         });
-        
         if (!finishResp.ok) throw new Error("Server rejected registration: " + await finishResp.text());
         
         const resData = await finishResp.json();
         if (resData.redirect_to) { window.location.href = resData.redirect_to; } 
         else { window.location.href = "/"; }
-    } catch (err) { console.error(err); alert("Registration Failed: " + err.message); }
+    } catch (err) { 
+        console.error("Registration Error:", err); 
+        alert("Registration Failed: " + err.message); 
+    }
 }
 
 async function passkeyLogin(username) {
     try {
         if (!username) throw new Error("Please enter a username");
-        const resp = await fetch('/auth/login/begin?username=' + encodeURIComponent(username));
-        if (!resp.ok) throw new Error("Server error: " + await resp.text());
-        const opts = await resp.json();
         
+        // Pass scope safely as a query parameter to the backend
+        const resp = await fetch('/auth/login/begin?username=' + encodeURIComponent(username) + '&scope=' + encodeURIComponent(authScope));
+        if (!resp.ok) throw new Error("Server error: " + await resp.text());
+        
+        const opts = await resp.json();
         opts.publicKey.challenge = base64urlToBuffer(opts.publicKey.challenge);
         if (opts.publicKey.allowCredentials) { opts.publicKey.allowCredentials.forEach(c => c.id = base64urlToBuffer(c.id)); }
         
-        // DBSC FIX: Explicitly request hardware-bound session extensions and define the scope
-        opts.publicKey.extensions = opts.publicKey.extensions || {};
-        opts.publicKey.extensions.devicePubKey = { attestation: "none" };
-        opts.publicKey.extensions.sessionScope = window.location.origin;
-
+        // Let the native API execute with pristine, valid options
         const assertion = await navigator.credentials.get({ publicKey: opts.publicKey });
         
-        // Extract the hardware extension results to send back to the SDF SessionManager
-        const extResults = assertion.getClientExtensionResults();
-
         const finishResp = await fetch('/auth/login/finish?username=' + encodeURIComponent(username), {
             method: 'POST', 
             headers: { 'Content-Type': 'application/json' },
@@ -76,7 +71,7 @@ async function passkeyLogin(username) {
                 id: assertion.id, 
                 rawId: bufferToBase64url(assertion.rawId), 
                 type: assertion.type, 
-                extensions: extResults, // Pass DBSC signature to backend
+                scope: authScope, // Inject scope into the backend validation payload
                 response: { 
                     authenticatorData: bufferToBase64url(assertion.response.authenticatorData), 
                     clientDataJSON: bufferToBase64url(assertion.response.clientDataJSON), 
@@ -85,13 +80,15 @@ async function passkeyLogin(username) {
                 }, 
             }),
         });
-        
         if (!finishResp.ok) throw new Error("Server rejected login: " + await finishResp.text());
         
         const resData = await finishResp.json();
         if (resData.redirect_to) { window.location.href = resData.redirect_to; } 
         else { window.location.href = "/"; }
-    } catch (err) { console.error(err); alert("Login Failed: " + err.message); }
+    } catch (err) { 
+        console.error("Login Error:", err); 
+        alert("Login Failed: " + err.message); 
+    }
 }
 
 function bufferToBase64url(buffer) {
