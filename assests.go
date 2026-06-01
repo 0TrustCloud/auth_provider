@@ -11,14 +11,36 @@ async function passkeyRegister(username) {
         const resp = await fetch('/auth/register/begin?username=' + encodeURIComponent(username));
         if (!resp.ok) throw new Error("Server error: " + await resp.text());
         const opts = await resp.json();
+        
         opts.publicKey.challenge = base64urlToBuffer(opts.publicKey.challenge);
         opts.publicKey.user.id = base64urlToBuffer(opts.publicKey.user.id);
         if(opts.publicKey.excludeCredentials) { opts.publicKey.excludeCredentials.forEach(c => c.id = base64urlToBuffer(c.id)); }
+        
+        // DBSC FIX: Explicitly request hardware-bound session extensions and define the scope
+        opts.publicKey.extensions = opts.publicKey.extensions || {};
+        opts.publicKey.extensions.devicePubKey = { attestation: "none" };
+        opts.publicKey.extensions.sessionScope = window.location.origin;
+
         const cred = await navigator.credentials.create({ publicKey: opts.publicKey });
+        
+        // Extract the hardware extension results to send back to the SDF SessionManager
+        const extResults = cred.getClientExtensionResults();
+
         const finishResp = await fetch('/auth/register/finish?username=' + encodeURIComponent(username), {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: cred.id, rawId: bufferToBase64url(cred.rawId), type: cred.type, response: { attestationObject: bufferToBase64url(cred.response.attestationObject), clientDataJSON: bufferToBase64url(cred.response.clientDataJSON), }, }),
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                id: cred.id, 
+                rawId: bufferToBase64url(cred.rawId), 
+                type: cred.type, 
+                extensions: extResults, // Pass DBSC payload to backend
+                response: { 
+                    attestationObject: bufferToBase64url(cred.response.attestationObject), 
+                    clientDataJSON: bufferToBase64url(cred.response.clientDataJSON), 
+                }, 
+            }),
         });
+        
         if (!finishResp.ok) throw new Error("Server rejected registration: " + await finishResp.text());
         
         const resData = await finishResp.json();
@@ -33,13 +55,37 @@ async function passkeyLogin(username) {
         const resp = await fetch('/auth/login/begin?username=' + encodeURIComponent(username));
         if (!resp.ok) throw new Error("Server error: " + await resp.text());
         const opts = await resp.json();
+        
         opts.publicKey.challenge = base64urlToBuffer(opts.publicKey.challenge);
         if (opts.publicKey.allowCredentials) { opts.publicKey.allowCredentials.forEach(c => c.id = base64urlToBuffer(c.id)); }
+        
+        // DBSC FIX: Explicitly request hardware-bound session extensions and define the scope
+        opts.publicKey.extensions = opts.publicKey.extensions || {};
+        opts.publicKey.extensions.devicePubKey = { attestation: "none" };
+        opts.publicKey.extensions.sessionScope = window.location.origin;
+
         const assertion = await navigator.credentials.get({ publicKey: opts.publicKey });
+        
+        // Extract the hardware extension results to send back to the SDF SessionManager
+        const extResults = assertion.getClientExtensionResults();
+
         const finishResp = await fetch('/auth/login/finish?username=' + encodeURIComponent(username), {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ id: assertion.id, rawId: bufferToBase64url(assertion.rawId), type: assertion.type, response: { authenticatorData: bufferToBase64url(assertion.response.authenticatorData), clientDataJSON: bufferToBase64url(assertion.response.clientDataJSON), signature: bufferToBase64url(assertion.response.signature), userHandle: assertion.response.userHandle ? bufferToBase64url(assertion.response.userHandle) : null, }, }),
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+                id: assertion.id, 
+                rawId: bufferToBase64url(assertion.rawId), 
+                type: assertion.type, 
+                extensions: extResults, // Pass DBSC signature to backend
+                response: { 
+                    authenticatorData: bufferToBase64url(assertion.response.authenticatorData), 
+                    clientDataJSON: bufferToBase64url(assertion.response.clientDataJSON), 
+                    signature: bufferToBase64url(assertion.response.signature), 
+                    userHandle: assertion.response.userHandle ? bufferToBase64url(assertion.response.userHandle) : null, 
+                }, 
+            }),
         });
+        
         if (!finishResp.ok) throw new Error("Server rejected login: " + await finishResp.text());
         
         const resData = await finishResp.json();
