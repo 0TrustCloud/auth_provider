@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -33,6 +34,13 @@ func (p *Provider) getClient(clientID string) (*OIDCClient, error) {
 }
 
 func (p *Provider) handlePostAuth(username string, w http.ResponseWriter, r *http.Request) {
+	p.handlePostAuthBound(username, "", w, r)
+}
+
+// handlePostAuthBound issues the session cookie and persists ActiveSession.
+// hardwareBinding is the passkey/DBSC material that makes SessionDBSCBound true
+// so product apps (MeshMail, Williwaw, …) accept the session globally.
+func (p *Provider) handlePostAuthBound(username, hardwareBinding string, w http.ResponseWriter, r *http.Request) {
 	if p.OnLoginSuccess != nil {
 		p.OnLoginSuccess(username, w, r)
 	}
@@ -44,31 +52,42 @@ func (p *Provider) handlePostAuth(username string, w http.ResponseWriter, r *htt
 
 	tokenString, jti, err := p.SessionManager.IssueCookieToken([]byte(cleanUsername), 24*time.Hour)
 	if err != nil {
+		p.logIDPError("SESSION_ISSUE", "failed issuing session for "+cleanUsername+": "+err.Error())
 		http.Error(w, "Failed to issue secure session", http.StatusInternalServerError)
 		return
 	}
+	p.logIDPAudit(cleanUsername, "SESSION_ISSUE", "session cookie issued for "+cleanUsername)
 
 	sessionCookie := &http.Cookie{
 		Name:     "session_id",
 		Value:    "user_session_" + tokenString,
 		Path:     "/",
-		Secure:   true,
+		Secure:   cookieSecure(r),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   86400,
 	}
 
-	cookieString := sessionCookie.String() + "; Sec-Provided-Session-Key"
-	w.Header().Add("Set-Cookie", cookieString)
-
-	nonceBytes := make([]byte, 32)
-	_, _ = rand.Read(nonceBytes)
-	regChallenge := base64.URLEncoding.EncodeToString(nonceBytes)
-
-	registrationHeader := fmt.Sprintf(`"/auth/dbsc/register"; challenge="%s"; es256`, regChallenge)
-	w.Header().Set("Sec-Session-Registration", registrationHeader)
+	http.SetCookie(w, sessionCookie)
+	// Draft Secure Sessions header (native browsers) + polyfill challenge for our JS.
+	w.Header().Set("Secure-Session-Registration", `(ES256 RS256); path="/StartSession"`)
+	challenge := make([]byte, 32)
+	if _, err := rand.Read(challenge); err == nil {
+		ch := base64.RawURLEncoding.EncodeToString(challenge)
+		w.Header().Set("Sec-Session-Registration", `challenge="`+ch+`"`)
+		// Nonce is advisory for polyfill; passkey binding is already on the session.
+		nTxn := p.SdfEngine.Store.Begin()
+		_ = p.SdfEngine.Store.Put(nTxn, []byte("data:dbsc_nonce:"+ch), []byte(jti), 10*time.Minute)
+		_ = nTxn.Commit()
+	}
 
 	sessionData := ActiveSession{Username: cleanUsername}
+	// Bind the WebAuthn credential used at login so DBSC is true immediately
+	// (global passkey = hardware binding across all product endpoints).
+	if strings.TrimSpace(hardwareBinding) != "" {
+		sessionData.DBSCPubKey = strings.TrimSpace(hardwareBinding)
+		p.logIDPAudit(cleanUsername, "DBSC_BIND", "session hardware-bound to passkey for "+cleanUsername)
+	}
 	sessionBytes, _ := json.Marshal(sessionData)
 
 	dataKey := "data:session:" + jti
@@ -88,45 +107,17 @@ func (p *Provider) handlePostAuth(username string, w http.ResponseWriter, r *htt
 		if err == nil {
 			var authReq AuthRequest
 			if json.Unmarshal(authReqBytes, &authReq) == nil {
-				authCode := "code_" + fmt.Sprintf("%d", time.Now().UnixNano())
-				codeKey := "data:auth_code:" + authCode
-
-				contextData, _ := json.Marshal(map[string]string{
-					"username":              cleanUsername,
-					"client_id":             authReq.ClientID,
-					"redirect_uri":          authReq.RedirectURI,
-					"nonce":                 authReq.Nonce,
-					"scope":                 authReq.Scope,
-					"code_challenge":        authReq.CodeChallenge,
-					"code_challenge_method": authReq.CodeChallengeMethod,
-				})
-
-				targetAddress := "oidc:auth_code:" + authCode
-				script := fmt.Sprintf(`oidc:code(client_id("%s") user("%s"))`, authReq.ClientID, cleanUsername)
-
-				// Register authorization code parameters securely via SDF compilation
-				tx := secure_data_format.DataInvocation{
-					TargetAddress: targetAddress,
-					Caller:        "oidc-authorization-server",
-					Nonce:         0,
-					Method:        "ISSUE_AUTH_CODE",
-					Profile:       secure_data_format.ProfileGrant,
-					Args:          map[string]interface{}{"context_raw": string(contextData)},
-				}
-
-				_, err = p.SdfEngine.CompileSecureData(script, tx)
-				if err != nil {
+				authCode, issueErr := p.issueOIDCAuthorizationCode(cleanUsername, authReq)
+				if issueErr != nil {
 					http.Error(w, "SDF compiler rejected authorization token generation", http.StatusInternalServerError)
 					return
 				}
 
-				wTxn := p.SdfEngine.Store.Begin()
-				_ = p.SdfEngine.Store.Put(wTxn, []byte(codeKey), contextData, 5*time.Minute)
-				_ = wTxn.Commit()
-
 				http.SetCookie(w, &http.Cookie{Name: "oidc_flow_id", Value: "", Path: "/", MaxAge: -1})
 
 				redirectURL := fmt.Sprintf("%s?code=%s&state=%s", authReq.RedirectURI, authCode, authReq.State)
+				p.logIDPAudit(cleanUsername, "OIDC_AUTH_CODE", fmt.Sprintf(
+					"authorization code issued for client %s user %s", authReq.ClientID, cleanUsername))
 				w.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(w).Encode(map[string]string{"redirect_to": redirectURL})
 				return
@@ -134,9 +125,188 @@ func (p *Provider) handlePostAuth(username string, w http.ResponseWriter, r *htt
 		}
 	}
 
+	returnTo := strings.TrimSpace(r.URL.Query().Get("return_to"))
+
+	// Platform faces (0trust.name): mint one-time handoff so the face host can set its own session cookie.
+	// WebAuthn cannot run on the face (rpId is 0trust.cloud).
+	if handoff, ok := p.faceHandoffURL(returnTo, cleanUsername, tokenString); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":      "success",
+			"redirect_to": handoff,
+		})
+		return
+	}
+
+	if returnTo != "" && strings.HasPrefix(returnTo, "/") && !strings.HasPrefix(returnTo, "//") {
+		if p.allowedReturnTo(returnTo) {
+			redirectURL := p.buildPostAuthRedirect(returnTo, tokenString)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":      "success",
+				"redirect_to": redirectURL,
+			})
+			return
+		}
+	}
+
+	if route := p.productRouteForReturnTo(returnTo); route != nil {
+		if p.respondProductOIDCSession(w, r, cleanUsername, route, returnTo) {
+			return
+		}
+	}
+
+	if route := p.productRouteForRequest(r); route != nil {
+		if returnTo == "" || returnTo == "/index" || returnTo == "/apps" {
+			if p.respondProductOIDCSession(w, r, cleanUsername, route, returnTo) {
+				return
+			}
+		}
+	}
+
+	if p.allowedReturnTo(returnTo) && p.productRouteForReturnTo(returnTo) == nil {
+		// Absolute return_to onto a platform face without prior handoff match.
+		if handoff, ok := p.faceHandoffURL(returnTo, cleanUsername, tokenString); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":      "success",
+				"redirect_to": handoff,
+			})
+			return
+		}
+		redirectURL := p.buildPostAuthRedirect(returnTo, tokenString)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":      "success",
+			"redirect_to": redirectURL,
+		})
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":      "success",
+		"redirect_to": "/index",
+	})
+}
+
+func (p *Provider) buildPostAuthRedirect(returnTo, tokenString string) string {
+	if strings.HasPrefix(returnTo, "/") && !strings.HasPrefix(returnTo, "//") {
+		return returnTo
+	}
+	u, err := url.Parse(returnTo)
+	if err != nil {
+		return "/index"
+	}
+	if u.Scheme == "http" {
+		host := strings.ToLower(u.Hostname())
+		if host == "127.0.0.1" || host == "localhost" {
+			sep := "?"
+			if strings.Contains(returnTo, "?") {
+				sep = "&"
+			}
+			return returnTo + sep + "session_id=" + url.QueryEscape(tokenString)
+		}
+	}
+	return returnTo
+}
+
+func (p *Provider) allowedReturnTo(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "/") && !strings.HasPrefix(raw, "//") {
+		return true
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	if u.Scheme == "http" {
+		host := strings.ToLower(u.Hostname())
+		return host == "127.0.0.1" || host == "localhost"
+	}
+	if u.Scheme != "https" {
+		return false
+	}
+	if issuer, err := url.Parse(p.issuer); err == nil && urlsSameOrigin(issuer, u) {
+		return true
+	}
+	if p != nil && p.isPlatformFaceHost(u.Hostname()) {
+		return true
+	}
+	if p.returnToMatchesRegisteredClient(u) {
+		return true
+	}
+	return hostMatchesTrustedProduct(u.Hostname())
+}
+
+func urlsSameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) && strings.EqualFold(a.Host, b.Host)
+}
+
+func hostMatchesTrustedProduct(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return false
+	}
+	trusted := []string{
+		"williwaw.app", "tunneltug.com", "defcon.chat", "bandy.chat", "motionkb.com", "0trust.codes",
+		"0trust.name", "www.0trust.name", "dns.0trust.name", "rdap.0trust.name",
+	}
+	for _, exact := range trusted {
+		if host == exact {
+			return true
+		}
+	}
+	suffixes := []string{".0trust.cloud", ".0trust.services", ".0trust.codes", ".0trust.name", ".mesh", ".social", ".tunnel", ".mail", ".search"}
+	for _, suffix := range suffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return isPlatformFaceHostname(host)
+}
+
+func (p *Provider) returnToMatchesRegisteredClient(target *url.URL) bool {
+	if p == nil || p.SdfEngine == nil || p.SdfEngine.Store == nil || target == nil {
+		return false
+	}
+	txn := p.SdfEngine.Store.Begin()
+	it := p.SdfEngine.Store.NewIterator(txn, []byte("data:client:"))
+	if it == nil {
+		return false
+	}
+	defer it.Close()
+	for {
+		_, value, err := it.Next()
+		if err != nil {
+			break
+		}
+		var client OIDCClient
+		if json.Unmarshal(value, &client) != nil {
+			continue
+		}
+		for _, redirectURI := range client.RedirectURIs {
+			ru, err := url.Parse(strings.TrimSpace(redirectURI))
+			if err != nil {
+				continue
+			}
+			if urlsSameOrigin(ru, target) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *Provider) ServeDiscovery(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +349,8 @@ func (p *Provider) Authorize(w http.ResponseWriter, r *http.Request) {
 
 	client, err := p.getClient(clientID)
 	if err != nil || responseType != "code" {
+		p.logIDPError("OIDC_AUTHORIZE", fmt.Sprintf("invalid client %s or response_type %s from %s",
+			clientID, responseType, clientIP(r)))
 		http.Error(w, "Unauthorized client or unsupported response type", http.StatusBadRequest)
 		return
 	}
@@ -191,9 +363,13 @@ func (p *Provider) Authorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !validURI {
+		p.logIDPError("OIDC_AUTHORIZE", fmt.Sprintf("invalid redirect_uri for client %s from %s",
+			clientID, clientIP(r)))
 		http.Error(w, "Invalid redirect URI", http.StatusBadRequest)
 		return
 	}
+	p.logIDPInfo("OIDC_AUTHORIZE", fmt.Sprintf("authorize request client=%s redirect=%s from %s",
+		clientID, redirectURI, clientIP(r)))
 
 	sessionCookie, err := r.Cookie("session_id")
 	if err == nil {
@@ -230,7 +406,7 @@ func (p *Provider) Authorize(w http.ResponseWriter, r *http.Request) {
 	_ = wTxn.Commit()
 
 	http.SetCookie(w, &http.Cookie{Name: "oidc_flow_id", Value: flowID, Path: "/", Secure: true, HttpOnly: true})
-	http.Redirect(w, r, "/login", http.StatusFound)
+	http.Redirect(w, r, "/auth", http.StatusFound)
 }
 
 func (p *Provider) TokenExchange(w http.ResponseWriter, r *http.Request) {
@@ -245,6 +421,7 @@ func (p *Provider) TokenExchange(w http.ResponseWriter, r *http.Request) {
 
 	_, err := p.getClient(clientID)
 	if err != nil {
+		p.logIDPError("OIDC_TOKEN", "invalid client credentials "+clientID+" from "+clientIP(r))
 		http.Error(w, "Invalid client credentials", http.StatusUnauthorized)
 		return
 	}
@@ -255,6 +432,7 @@ func (p *Provider) TokenExchange(w http.ResponseWriter, r *http.Request) {
 	txn.Commit()
 
 	if err != nil {
+		p.logIDPError("OIDC_TOKEN", "invalid authorization code from "+clientIP(r))
 		http.Error(w, "Invalid authorization code", http.StatusBadRequest)
 		return
 	}
@@ -267,6 +445,7 @@ func (p *Provider) TokenExchange(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(contextBytes, &context)
 
 	if context["client_id"] != clientID {
+		p.logIDPError("OIDC_TOKEN", "client mismatch for code exchange from "+clientIP(r))
 		http.Error(w, "Client mismatch", http.StatusBadRequest)
 		return
 	}
@@ -344,6 +523,8 @@ func (p *Provider) TokenExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	p.logIDPAudit(context["username"], "OIDC_TOKEN", fmt.Sprintf(
+		"tokens issued for user %s client %s from %s", context["username"], clientID, clientIP(r)))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"access_token": accessToken,
@@ -386,6 +567,7 @@ func (p *Provider) RevokeToken(w http.ResponseWriter, r *http.Request) {
 	_ = p.SdfEngine.Store.Delete(txn, []byte(tokenKey))
 	_ = txn.Commit()
 
+	p.logIDPInfo("OIDC_REVOKE", "access token revoked from "+clientIP(r))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -441,6 +623,7 @@ func (p *Provider) RegisterClient(w http.ResponseWriter, r *http.Request) {
 	_ = p.SdfEngine.Store.Put(txn, []byte(dataKey), clientBytes, 0)
 	_ = txn.Commit()
 
+	p.logIDPAudit(client.ClientID, "OIDC_CLIENT_REGISTER", "registered client "+req.ClientName)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(client)

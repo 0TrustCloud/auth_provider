@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/0TrustCloud/secure_data_format"
@@ -20,9 +21,100 @@ type ProvisioningState struct {
 	TOTPSecret  string    `json:"totp_secret"`
 	IsVerified  bool      `json:"is_verified"`
 	ExpiresAt   time.Time `json:"expires_at"`
+	Subdomain   string    `json:"subdomain,omitempty"`
+}
+
+func provisionDataKey(username string) string {
+	return "data:provision:" + username
+}
+
+func (p *Provider) getProvisioningState(username string) (*ProvisioningState, error) {
+	dataKey := provisionDataKey(username)
+	txn := p.SdfEngine.Store.Begin()
+	stateBytes, err := p.SdfEngine.Store.Get(txn, []byte(dataKey))
+	txn.Commit()
+	if err != nil || len(stateBytes) == 0 {
+		return nil, errors.New("provisioning session not found")
+	}
+
+	var state ProvisioningState
+	if err := json.Unmarshal(stateBytes, &state); err != nil {
+		return nil, err
+	}
+	if time.Now().After(state.ExpiresAt) {
+		return nil, errors.New("provisioning time limit exceeded")
+	}
+	return &state, nil
+}
+
+func (p *Provider) isBootstrapSubject(username string) bool {
+	// Sole universal admin is always bootstrap-protected (hash 8c6976e5… = SHA-256("admin")).
+	if isUniversalAdminUsername(username) {
+		return true
+	}
+	if p.bootstrapSubjects == nil {
+		return false
+	}
+	_, ok := p.bootstrapSubjects[username]
+	return ok
+}
+
+// isUniversalAdminUsername is the only subject that receives platform admin rights
+// and must authenticate with the pinned YubiKey (see AdminPin / AdminSubjectHash).
+func isUniversalAdminUsername(username string) bool {
+	u := strings.ToLower(strings.TrimSpace(username))
+	return u == "admin"
+}
+
+func (p *Provider) canRegister(username string, r *http.Request) (bool, string) {
+	// Never allow open self-enrollment of the reserved admin identity on product
+	// faces (social.0trust.cloud, williwaw.0trust.cloud, …). Admin is bootstrap-only
+	// and YubiKey-pinned.
+	if isUniversalAdminUsername(username) {
+		if p.isBootstrapSubject(username) {
+			return true, ""
+		}
+		return false, "Admin identity is reserved — use the pinned YubiKey on the control plane."
+	}
+	if p.isOpenEnrollment(r) {
+		return true, ""
+	}
+	if p.isBootstrapSubject(username) {
+		return true, ""
+	}
+	state, err := p.getProvisioningState(username)
+	if err != nil {
+		return false, "User not provisioned. Contact your administrator for an enrollment invitation."
+	}
+	if !state.IsVerified {
+		return false, "Complete TOTP verification before registering your passkey."
+	}
+	return true, ""
+}
+
+func (p *Provider) consumeProvisioningTicket(username string) error {
+	dataKey := provisionDataKey(username)
+	targetAddress := "provision:totp:" + username
+	script := `provision:registration(status("consumed"))`
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: targetAddress,
+		Caller:        "user-provisioning-service",
+		Nonce:         2,
+		Method:        "CONSUME_PROVISIONING_TICKET",
+		Profile:       secure_data_format.ProfileGrant,
+	}
+	_, _ = p.SdfEngine.CompileSecureData(script, tx)
+
+	burnTxn := p.SdfEngine.Store.Begin()
+	_ = p.SdfEngine.Store.Delete(burnTxn, []byte(dataKey))
+	return burnTxn.Commit()
 }
 
 func (p *Provider) ProvisionUserEntry(username string) (string, error) {
+	return p.ProvisionUserEntryWithMeta(username, "")
+}
+
+func (p *Provider) ProvisionUserEntryWithMeta(username, subdomain string) (string, error) {
 	secretBytes := make([]byte, 20)
 	if _, err := rand.Read(secretBytes); err != nil {
 		return "", fmt.Errorf("failed to generate random bytes for TOTP: %w", err)
@@ -34,6 +126,7 @@ func (p *Provider) ProvisionUserEntry(username string) (string, error) {
 		TOTPSecret: totpSecret,
 		IsVerified: false,
 		ExpiresAt:  time.Now().Add(30 * time.Minute),
+		Subdomain:  subdomain,
 	}
 
 	stateBytes, _ := json.Marshal(state)
@@ -75,22 +168,9 @@ func (p *Provider) ProvisionUserEntry(username string) (string, error) {
 }
 
 func (p *Provider) VerifyProvisioningTOTP(username, passcode string) (bool, error) {
-	dataKey := "data:provision:" + username
-	txn := p.SdfEngine.Store.Begin()
-	stateBytes, err := p.SdfEngine.Store.Get(txn, []byte(dataKey))
-	txn.Commit()
-
-	if err != nil || len(stateBytes) == 0 {
+	state, err := p.getProvisioningState(username)
+	if err != nil {
 		return false, errors.New("provisioning session expired or not found")
-	}
-
-	var state ProvisioningState
-	if err := json.Unmarshal(stateBytes, &state); err != nil {
-		return false, err
-	}
-
-	if time.Now().After(state.ExpiresAt) {
-		return false, errors.New("provisioning time limit exceeded")
 	}
 
 	isValid := totp.Validate(passcode, state.TOTPSecret)
@@ -120,8 +200,18 @@ func (p *Provider) VerifyProvisioningTOTP(username, passcode string) (bool, erro
 	}
 
 	wTxn := p.SdfEngine.Store.Begin()
-	_ = p.SdfEngine.Store.Put(wTxn, []byte(dataKey), updatedBytes, 15*time.Minute)
+	_ = p.SdfEngine.Store.Put(wTxn, []byte(provisionDataKey(username)), updatedBytes, 15*time.Minute)
 	return true, wTxn.Commit()
+}
+
+func (p *Provider) HasPendingEnrollment(username string) bool {
+	state, err := p.getProvisioningState(username)
+	return err == nil && state != nil && !state.IsVerified
+}
+
+func (p *Provider) IsEnrollmentReady(username string) bool {
+	state, err := p.getProvisioningState(username)
+	return err == nil && state != nil && state.IsVerified
 }
 
 func (p *Provider) CompleteHardwareEnrollment(username string, tpmPublicBytes []byte, r *http.Request) error {

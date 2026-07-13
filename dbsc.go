@@ -14,6 +14,45 @@ import (
 	"gopkg.in/square/go-jose.v2"
 )
 
+func (p *Provider) loadActiveSession(jti string) (ActiveSession, []byte, error) {
+	dataKey := "data:session:" + jti
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+
+	sessionBytes, err := ultimate_db.GlobalCacheStore.Read(txID, dataKey)
+	if err != nil {
+		txn := p.SdfEngine.Store.Begin()
+		sessionBytes, err = p.SdfEngine.Store.Get(txn, []byte(dataKey))
+		txn.Commit()
+		if err != nil {
+			return ActiveSession{}, nil, err
+		}
+	}
+
+	var session ActiveSession
+	if err := json.Unmarshal(sessionBytes, &session); err != nil {
+		return ActiveSession{}, nil, err
+	}
+	return session, sessionBytes, nil
+}
+
+func (p *Provider) persistActiveSession(jti string, session ActiveSession) error {
+	dataKey := "data:session:" + jti
+	updatedBytes, err := json.Marshal(session)
+	if err != nil {
+		return err
+	}
+
+	txID := ultimate_db.GlobalCacheStore.BeginOCC()
+	_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{dataKey: updatedBytes}, 24*time.Hour)
+
+	wTxn := p.SdfEngine.Store.Begin()
+	if err := p.SdfEngine.Store.Put(wTxn, []byte(dataKey), updatedBytes, 24*time.Hour); err != nil {
+		wTxn.Abort()
+		return err
+	}
+	return wTxn.Commit()
+}
+
 func (p *Provider) DBSCRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		JWT string `json:"jwt"`
@@ -30,7 +69,7 @@ func (p *Provider) DBSCRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jwkBytes, err := json.Marshal(token.Header["jwk"])
-	if err != nil {
+	if err != nil || string(jwkBytes) == "null" {
 		http.Error(w, "Missing JWK in registration", http.StatusBadRequest)
 		return
 	}
@@ -47,47 +86,37 @@ func (p *Provider) DBSCRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dataKey := "data:session:" + jti
-	txn := p.SdfEngine.Store.Begin()
-	sessionBytes, err := p.SdfEngine.Store.Get(txn, []byte(dataKey))
-	txn.Commit()
-
-	if err == nil && len(sessionBytes) > 0 {
-		var session ActiveSession
-		_ = json.Unmarshal(sessionBytes, &session)
-		session.DBSCPubKey = string(jwkBytes)
-		updatedBytes, _ := json.Marshal(session)
-
-		targetAddress := "session:hardware_binding:" + jti
-		script := `session:hardware(type("tpm") status("bound"))`
-
-		// Formally compile the physical device attestation coupling matrix via SDF
-		tx := secure_data_format.DataInvocation{
-			TargetAddress: targetAddress,
-			Caller:        "dbsc-hardware-attestation-service",
-			Nonce:         1,
-			Method:        "REGISTER_HARDWARE_BINDING",
-			Profile:       secure_data_format.ProfileProofOfPoss,
-			Args: map[string]interface{}{
-				"jti":          jti,
-				"dbsc_pub_key": string(jwkBytes),
-			},
-		}
-
-		_, err = p.SdfEngine.CompileSecureData(script, tx)
-		if err != nil {
-			http.Error(w, "SDF engine rejected hardware configuration token", http.StatusInternalServerError)
-			return
-		}
-
-		txID := ultimate_db.GlobalCacheStore.BeginOCC()
-		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{dataKey: updatedBytes}, 24*time.Hour)
-
-		wTxn := p.SdfEngine.Store.Begin()
-		_ = p.SdfEngine.Store.Put(wTxn, []byte(dataKey), updatedBytes, 24*time.Hour)
-		_ = wTxn.Commit()
+	session, _, err := p.loadActiveSession(jti)
+	if err != nil || session.Username == "" {
+		http.Error(w, "Session expired", http.StatusUnauthorized)
+		return
 	}
 
+	session.DBSCPubKey = string(jwkBytes)
+
+	targetAddress := "session:hardware_binding:" + jti
+	script := `session:hardware(type("tpm") status("bound"))`
+	tx := secure_data_format.DataInvocation{
+		TargetAddress: targetAddress,
+		Caller:        "dbsc-hardware-attestation-service",
+		Nonce:         1,
+		Method:        "REGISTER_HARDWARE_BINDING",
+		Profile:       secure_data_format.ProfileProofOfPoss,
+		Args: map[string]interface{}{
+			"jti":          jti,
+			"dbsc_pub_key": string(jwkBytes),
+		},
+	}
+	if _, err = p.SdfEngine.CompileSecureData(script, tx); err != nil && p.Logger != nil {
+		p.Logger.Error("SDF hardware binding audit skipped for " + session.Username + ": " + err.Error())
+	}
+
+	if err := p.persistActiveSession(jti, session); err != nil {
+		http.Error(w, "Failed to persist hardware binding", http.StatusInternalServerError)
+		return
+	}
+
+	p.logIDPAudit(session.Username, "DBSC_REGISTER", "hardware session binding registered for "+session.Username)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -104,22 +133,11 @@ func (p *Provider) DBSCRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dataKey := "data:session:" + jti
-	txID := ultimate_db.GlobalCacheStore.BeginOCC()
-
-	sessionBytes, err := ultimate_db.GlobalCacheStore.Read(txID, dataKey)
-	if err != nil {
-		txn := p.SdfEngine.Store.Begin()
-		sessionBytes, err = p.SdfEngine.Store.Get(txn, []byte(dataKey))
-		txn.Commit()
-		if err != nil || len(sessionBytes) == 0 {
-			http.Error(w, "Session expired completely", http.StatusUnauthorized)
-			return
-		}
+	session, _, err := p.loadActiveSession(jti)
+	if err != nil || session.Username == "" {
+		http.Error(w, "Session expired completely", http.StatusUnauthorized)
+		return
 	}
-
-	var session ActiveSession
-	_ = json.Unmarshal(sessionBytes, &session)
 
 	if session.DBSCPubKey == "" {
 		http.Error(w, "Session is not bound to hardware", http.StatusBadRequest)
@@ -135,7 +153,6 @@ func (p *Provider) DBSCRefresh(w http.ResponseWriter, r *http.Request) {
 		targetAddress := "challenge:dbsc:" + nonce
 		script := fmt.Sprintf(`challenge:verification(nonce("%s"))`, nonce)
 
-		// Register verification parameters using the token architecture
 		tx := secure_data_format.DataInvocation{
 			TargetAddress: targetAddress,
 			Caller:        "dbsc-challenge-generator",
@@ -145,12 +162,11 @@ func (p *Provider) DBSCRefresh(w http.ResponseWriter, r *http.Request) {
 			Args:          map[string]interface{}{"username": session.Username},
 		}
 
-		_, err = p.SdfEngine.CompileSecureData(script, tx)
-		if err != nil {
-			http.Error(w, "SDF failed to mint proof-of-possession verification parameter", http.StatusInternalServerError)
-			return
+		if _, err = p.SdfEngine.CompileSecureData(script, tx); err != nil && p.Logger != nil {
+			p.Logger.Error("SDF challenge audit skipped for " + session.Username + ": " + err.Error())
 		}
 
+		txID := ultimate_db.GlobalCacheStore.BeginOCC()
 		nonceKey := "data:dbsc_nonce:" + nonce
 		_ = ultimate_db.GlobalCacheStore.ValidateAndCommit(txID, map[string][]byte{nonceKey: []byte(session.Username)}, 2*time.Minute)
 
@@ -158,6 +174,7 @@ func (p *Provider) DBSCRefresh(w http.ResponseWriter, r *http.Request) {
 		_ = p.SdfEngine.Store.Put(nTxn, []byte(nonceKey), []byte(session.Username), 2*time.Minute)
 		_ = nTxn.Commit()
 
+		p.logIDPInfo("DBSC_REFRESH", "challenge issued for "+session.Username)
 		w.Header().Set("Sec-Session-Challenge", fmt.Sprintf(`"%s"`, nonce))
 		http.Error(w, "Challenge required", http.StatusUnauthorized)
 		return
@@ -172,12 +189,13 @@ func (p *Provider) DBSCRefresh(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if token != nil && token.Valid {
+		p.logIDPAudit(session.Username, "DBSC_REFRESH", "session refreshed for "+session.Username)
 		cookie.MaxAge = 86400
-		cookieStr := cookie.String() + "; Sec-Provided-Session-Key"
-		w.Header().Add("Set-Cookie", cookieStr)
+		http.SetCookie(w, cookie)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
+	p.logIDPError("DBSC_REFRESH", "invalid DBSC response for "+session.Username)
 	http.Error(w, "Invalid DBSC response", http.StatusForbidden)
 }

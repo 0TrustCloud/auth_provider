@@ -65,6 +65,10 @@ func (m *mockKVStore) NewIterator(txn ultimate_db.TxnHandle, prefix []byte) ulti
 	return nil
 }
 
+func (m *mockKVStore) Flush() error {
+	return nil
+}
+
 type mockLockManager struct {
 	acquiredLocks map[string]uint64
 }
@@ -107,7 +111,7 @@ func setupTestProvider(t *testing.T) (*Provider, *secure_data_format.SecureDataE
 		Mux: http.NewServeMux(),
 	}
 
-	p, err := New(gk, sm, sdf, "Test Realm", "localhost", "https://localhost")
+	p, err := New(gk, sm, sdf, "Test Realm", "localhost", "https://localhost", "")
 	if err != nil {
 		t.Fatalf("failed to assemble active auth_provider: %v", err)
 	}
@@ -118,6 +122,24 @@ func setupTestProvider(t *testing.T) (*Provider, *secure_data_format.SecureDataE
 // =============================================================================
 // Identity Provider Test Matrix
 // =============================================================================
+
+func TestProvider_BeginRegistrationDoesNotPersistUser(t *testing.T) {
+	p, _, _, _ := setupTestProvider(t)
+	username := "eclipse-target-user"
+	p.AllowBootstrapRegistration(username)
+
+	req := httptest.NewRequest("GET", "/auth/register/begin?username="+username, nil)
+	w := httptest.NewRecorder()
+	p.BeginRegistration(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected registration begin to succeed, got: %d (%s)", w.Code, w.Body.String())
+	}
+
+	if _, err := p.getUser(username); err == nil {
+		t.Fatal("expected username to remain unclaimed until registration finishes")
+	}
+}
 
 func TestProvider_UserLifecycleViaSDF(t *testing.T) {
 	p, _, _, _ := setupTestProvider(t)
@@ -141,6 +163,62 @@ func TestProvider_UserLifecycleViaSDF(t *testing.T) {
 
 	if retrieved.DisplayName != user.DisplayName {
 		t.Errorf("profile context corruption. Expected %s, got %s", user.DisplayName, retrieved.DisplayName)
+	}
+}
+
+func TestProvider_RegistrationGateBlocksUnprovisionedUsers(t *testing.T) {
+	p, _, _, _ := setupTestProvider(t)
+	username := "random-user"
+
+	req := httptest.NewRequest("GET", "/auth/register/begin?username="+username, nil)
+	w := httptest.NewRecorder()
+	p.BeginRegistration(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unprovisioned registration, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProvider_RegistrationGateAllowsVerifiedProvisionedUsers(t *testing.T) {
+	p, _, _, _ := setupTestProvider(t)
+	username := "provisioned-user"
+
+	if _, err := p.ProvisionUserEntry(username); err != nil {
+		t.Fatalf("failed provisioning user: %v", err)
+	}
+
+	state, err := p.getProvisioningState(username)
+	if err != nil {
+		t.Fatalf("missing provisioning state: %v", err)
+	}
+	passcode, err := totp.GenerateCode(state.TOTPSecret, time.Now())
+	if err != nil {
+		t.Fatalf("failed generating TOTP: %v", err)
+	}
+	verified, err := p.VerifyProvisioningTOTP(username, passcode)
+	if err != nil || !verified {
+		t.Fatalf("TOTP verification failed: verified=%v err=%v", verified, err)
+	}
+
+	req := httptest.NewRequest("GET", "/auth/register/begin?username="+username, nil)
+	w := httptest.NewRecorder()
+	p.BeginRegistration(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected registration begin for verified provisioned user, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestProvider_BootstrapUserMayRegisterWithoutProvisioning(t *testing.T) {
+	p, _, _, _ := setupTestProvider(t)
+	p.AllowBootstrapRegistration("admin")
+
+	req := httptest.NewRequest("GET", "/auth/register/begin?username=admin", nil)
+	w := httptest.NewRecorder()
+	p.BeginRegistration(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected bootstrap user registration, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -178,15 +256,14 @@ func TestProvider_TOTPProvisioningFlow(t *testing.T) {
 
 func TestProvider_DBSCRegisterHardwareBinding(t *testing.T) {
 	p, sdf, _, privKey := setupTestProvider(t)
-	jti := "session_token_jti_4041"
 
 	session := ActiveSession{Username: "operator-core"}
 	sessionBytes, _ := json.Marshal(session)
-	dataKey := "data:session:" + jti
 
-	txn := sdf.Store.Begin()
-	_ = sdf.Store.Put(txn, []byte(dataKey), sessionBytes, 1*time.Hour)
-	_ = txn.Commit()
+	sessionToken, jti, _ := p.SessionManager.IssueCookieToken([]byte("operator-core"), 1*time.Hour)
+	wTxn := sdf.Store.Begin()
+	_ = sdf.Store.Put(wTxn, []byte("data:session:"+jti), sessionBytes, 1*time.Hour)
+	_ = wTxn.Commit()
 
 	token := jwt.New(jwt.SigningMethodRS256)
 	token.Header["jwk"] = map[string]interface{}{
@@ -194,7 +271,6 @@ func TestProvider_DBSCRegisterHardwareBinding(t *testing.T) {
 		"n":   "mock-public-modulus-string-bytes-thru-wire",
 		"e":   "AQAB",
 	}
-	
 	signedJWTString, err := token.SignedString(privKey)
 	if err != nil {
 		t.Fatalf("failed signing verification JWT: %v", err)
@@ -203,15 +279,11 @@ func TestProvider_DBSCRegisterHardwareBinding(t *testing.T) {
 	regPayload := struct {
 		JWT string `json:"jwt"`
 	}{JWT: signedJWTString}
-
 	bodyBytes, _ := json.Marshal(regPayload)
 	req := httptest.NewRequest("POST", "/auth/dbsc/register", bytes.NewReader(bodyBytes))
-	
-	sessionToken, _, _ := p.SessionManager.IssueCookieToken([]byte("operator-core"), 1*time.Hour)
 	req.AddCookie(&http.Cookie{Name: "session_id", Value: "user_session_" + sessionToken})
-	
-	w := httptest.NewRecorder()
 
+	w := httptest.NewRecorder()
 	p.DBSCRegister(w, req)
 
 	if w.Code != http.StatusOK {

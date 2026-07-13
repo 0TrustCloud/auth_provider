@@ -36,5 +36,9 @@ type AuthRequest struct {
 
 type ActiveSession struct {
 	Username   string `json:"username"`
-	DBSCPubKey string `json:"dbsc_pub_key,omitempty"` 
+	DBSCPubKey string `json:"dbsc_pub_key,omitempty"`
+}
+
+type pendingRegistration struct {
+	UserID []byte `json:"user_id"`
 }

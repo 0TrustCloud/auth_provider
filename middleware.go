@@ -13,7 +13,7 @@ func (p *Provider) AuthGuard(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session_id")
 		if err != nil {
-			http.Redirect(w, r, "/login", http.StatusFound)
+			http.Redirect(w, r, "/auth", http.StatusFound)
 			return
 		}
 
