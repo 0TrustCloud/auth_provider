@@ -5,10 +5,10 @@ go 1.25.10
 require (
 	github.com/0TrustCloud/guikit v1.1.2
 	github.com/0TrustCloud/logger v1.0.3
-	github.com/0TrustCloud/samln v1.0.3
+	github.com/0TrustCloud/samln v1.0.5
 	github.com/0TrustCloud/secure_data_format v1.0.0
 	github.com/0TrustCloud/secure_policy v1.0.6
-	github.com/0TrustCloud/ultimate_db v1.2.2
+	github.com/0TrustCloud/ultimate_db v1.3.6
 	github.com/go-webauthn/webauthn v0.17.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/pquerna/otp v1.5.0
